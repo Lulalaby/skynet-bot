@@ -9,13 +9,15 @@ using DisCatSharp.Interactivity;
 using DisCatSharp.Interactivity.Enums;
 using DisCatSharp.Interactivity.Extensions;
 using DisCatSharp.SlashCommands;
-using Microsoft.AspNetCore.Mvc.TagHelpers.Cache;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Skynet.Bot.Analyzers;
 using Skynet.Bot.Extensions;
 using Skynet.Bot.Interfaces;
-using Skynet.Bot.SlashCommands;
+using Skynet.Bot.Options;
 
 namespace Skynet.Bot
 {
@@ -28,35 +30,22 @@ namespace Skynet.Bot
         public SlashCommandsExtension SlashCommands { get; }
         public IServiceProvider ServiceProvider { get; }
         
-        private DiscordGuild mainGuild;
-        public DiscordGuild MainGuild
-        {
-            get
-            {
-                if(mainGuild == null)
-                    if (Client.Guilds.Any())
-                        #if DEBUG
-                        mainGuild = Client.Guilds[885538658533376020];
-                        #elif RELEASE
-                        mainGuild = Client.Guilds[862027572455407616];
-                        #endif
-
-                return mainGuild;
-            }
-        }
+        public DiscordGuild MainGuild { get; private set; }
         #endregion
 
         private readonly IConfiguration _configuration;
         private readonly ILogger<Bot> _logger;
-
-        public Bot(IConfiguration configuration, ILogger<Bot> logger, IServiceProvider serviceProvider)
+        private IMessageAnalyzer[] _messageAnalyzers;
+        
+        public Bot(IConfiguration configuration, ILogger<Bot> logger, IServiceProvider serviceProvider,
+            IOptions<BotOptions> options)
         {
             _configuration = configuration;
             _logger = logger;
             
             var discordConfig = new DiscordConfiguration
             {
-                Token = _configuration["Bot:Token"],
+                Token = options.Value.Token,
                 TokenType = TokenType.Bot,
                 MinimumLogLevel = LogLevel.Information,
                 AutoReconnect = true,
@@ -95,8 +84,25 @@ namespace Skynet.Bot
             {
                 Services = serviceProvider
             });
-
+            
+            // automatically register our slash commands
             slashCommandsExtension.RegisterCommandsFromAssembly<Program>();
+            
+            InitializeAnalyzers();
+        }
+
+        private void InitializeAnalyzers()
+        {
+            // Register 
+            var analyzerTypes = GetType().Assembly
+                .ExportedTypes
+                .Where(x => x.IsAssignableTo(typeof(IMessageAnalyzer)) && !x.IsAbstract)
+                .ToArray();
+
+            _messageAnalyzers = new IMessageAnalyzer[analyzerTypes.Length];
+
+            for (int i = 0; i < analyzerTypes.Length; i++)
+                _messageAnalyzers[i] = (IMessageAnalyzer) ActivatorUtilities.CreateInstance(ServiceProvider, analyzerTypes[i]);
         }
 
         private Task OnComponentInteractionCreated(DiscordClient sender, ComponentInteractionCreateEventArgs e)
@@ -111,13 +117,30 @@ namespace Skynet.Bot
 
         private async Task OnMessageCreated(DiscordClient sender, MessageCreateEventArgs e)
         {
-            
+            // We don't care if you're a bot
+            if (e.Author.IsBot)
+                return;
+
+            foreach (var analyzer in _messageAnalyzers)
+                if (!e.Handled)
+                {
+                    bool result = await analyzer.ProcessMessage(sender, e);
+                    
+                    if (result)
+                        return;
+                }
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             await Client.ConnectAsync();
-
+            
+            #if DEBUG
+            MainGuild = await Client.GetGuildAsync(885538658533376020);
+            #elif RELEASE
+            MainGuild = await Client.GetGuildAsync(862027572455407616);
+            #endif
+            
             while (!stoppingToken.IsCancellationRequested)
                 await Task.Delay(1000, stoppingToken);
         }
